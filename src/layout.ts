@@ -37,30 +37,42 @@ const canvas = typeof OffscreenCanvas !== 'undefined'
   : document.createElement('canvas')
 const ctx = canvas.getContext('2d')!
 
-// Word width cache: font → Map<segment, width>.
+// Segment metrics cache: font → Map<segment, metrics>.
 // Persists across prepare() calls. Common words ("the", "a", etc.) are measured
 // once and shared across all text blocks. Survives resize since font doesn't change.
+// Besides width, entries can lazily retain grapheme widths and other derived facts,
+// so repeated segments stop paying the same text-analysis cost inside prepare().
 // No eviction: grows monotonically per font. Typical single-font feed ≈ few KB.
 // Call clearCache() to reclaim if needed (e.g. font change, long session).
 
-const wordCaches = new Map<string, Map<string, number>>()
+type SegmentMetrics = {
+  width: number
+  containsCJK: boolean
+  emojiCount?: number
+  graphemeWidths?: number[] | null
+}
 
-function getWordCache(font: string): Map<string, number> {
-  let cache = wordCaches.get(font)
+const segmentMetricCaches = new Map<string, Map<string, SegmentMetrics>>()
+
+function getSegmentMetricCache(font: string): Map<string, SegmentMetrics> {
+  let cache = segmentMetricCaches.get(font)
   if (!cache) {
     cache = new Map()
-    wordCaches.set(font, cache)
+    segmentMetricCaches.set(font, cache)
   }
   return cache
 }
 
-function measureSegment(seg: string, cache: Map<string, number>): number {
-  let w = cache.get(seg)
-  if (w === undefined) {
-    w = ctx.measureText(seg).width
-    cache.set(seg, w)
+function getSegmentMetrics(seg: string, cache: Map<string, SegmentMetrics>): SegmentMetrics {
+  let metrics = cache.get(seg)
+  if (metrics === undefined) {
+    metrics = {
+      width: ctx.measureText(seg).width,
+      containsCJK: isCJK(seg),
+    }
+    cache.set(seg, metrics)
   }
-  return w
+  return metrics
 }
 
 type EngineProfile = {
@@ -177,6 +189,36 @@ function countEmojiGraphemes(text: string): number {
     if (isEmojiGrapheme(g.segment)) count++
   }
   return count
+}
+
+function getEmojiCount(seg: string, metrics: SegmentMetrics): number {
+  if (metrics.emojiCount === undefined) {
+    metrics.emojiCount = countEmojiGraphemes(seg)
+  }
+  return metrics.emojiCount
+}
+
+function getCorrectedSegmentWidth(seg: string, metrics: SegmentMetrics, emojiCorrection: number): number {
+  if (emojiCorrection === 0) return metrics.width
+  return metrics.width - getEmojiCount(seg, metrics) * emojiCorrection
+}
+
+function getSegmentGraphemeWidths(
+  seg: string,
+  metrics: SegmentMetrics,
+  cache: Map<string, SegmentMetrics>,
+  emojiCorrection: number,
+): number[] | null {
+  if (metrics.graphemeWidths !== undefined) return metrics.graphemeWidths
+
+  const widths: number[] = []
+  for (const gs of sharedGraphemeSegmenter.segment(seg)) {
+    const graphemeMetrics = getSegmentMetrics(gs.segment, cache)
+    widths.push(getCorrectedSegmentWidth(gs.segment, graphemeMetrics, emojiCorrection))
+  }
+
+  metrics.graphemeWidths = widths.length > 1 ? widths : null
+  return metrics.graphemeWidths
 }
 
 function containsArabicScript(text: string): boolean {
@@ -839,7 +881,7 @@ function measureAnalysis(
   includeSegments: boolean,
 ): PreparedText | PreparedTextWithSegments {
   ctx.font = font
-  const cache = getWordCache(font)
+  const cache = getSegmentMetricCache(font)
   const fontSize = parseFontSize(font)
   const emojiCorrection = getEmojiCorrection(font, fontSize)
 
@@ -870,8 +912,9 @@ function measureAnalysis(
     const segWordLike = analysis.isWordLike[mi]!
     const segKind = analysis.kinds[mi]!
     const segStart = analysis.starts[mi]!
+    const segMetrics = getSegmentMetrics(segText, cache)
 
-    if (segKind === 'text' && isCJK(segText)) {
+    if (segKind === 'text' && segMetrics.containsCJK) {
       let unitText = ''
       let unitStart = 0
 
@@ -896,10 +939,8 @@ function measureAnalysis(
           continue
         }
 
-        let w = measureSegment(unitText, cache)
-        if (emojiCorrection > 0 && isEmojiGrapheme(unitText)) {
-          w -= emojiCorrection
-        }
+        const unitMetrics = getSegmentMetrics(unitText, cache)
+        const w = getCorrectedSegmentWidth(unitText, unitMetrics, emojiCorrection)
         pushMeasuredSegment(unitText, w, 'text', segStart + unitStart, null)
 
         unitText = grapheme
@@ -907,33 +948,18 @@ function measureAnalysis(
       }
 
       if (unitText.length > 0) {
-        let w = measureSegment(unitText, cache)
-        if (emojiCorrection > 0 && isEmojiGrapheme(unitText)) {
-          w -= emojiCorrection
-        }
+        const unitMetrics = getSegmentMetrics(unitText, cache)
+        const w = getCorrectedSegmentWidth(unitText, unitMetrics, emojiCorrection)
         pushMeasuredSegment(unitText, w, 'text', segStart + unitStart, null)
       }
       continue
     }
 
-    let w = measureSegment(segText, cache)
-    if (emojiCorrection > 0 && emojiPresentationRe.test(segText)) {
-      w -= countEmojiGraphemes(segText) * emojiCorrection
-    }
+    const w = getCorrectedSegmentWidth(segText, segMetrics, emojiCorrection)
 
     if (segWordLike && segText.length > 1) {
-      let gCount = 0
-      let gWidths: number[] | null = null
-      for (const gs of sharedGraphemeSegmenter.segment(segText)) {
-        if (gCount === 0) gWidths = []
-        let gw = measureSegment(gs.segment, cache)
-        if (emojiCorrection > 0 && isEmojiGrapheme(gs.segment)) {
-          gw -= emojiCorrection
-        }
-        gWidths![gCount] = gw
-        gCount++
-      }
-      pushMeasuredSegment(segText, w, segKind, segStart, gCount > 1 ? gWidths : null)
+      const graphemeWidths = getSegmentGraphemeWidths(segText, segMetrics, cache, emojiCorrection)
+      pushMeasuredSegment(segText, w, segKind, segStart, graphemeWidths)
     } else {
       pushMeasuredSegment(segText, w, segKind, segStart, null)
     }
@@ -1265,6 +1291,6 @@ export function layoutWithLines(prepared: PreparedTextWithSegments, maxWidth: nu
 }
 
 export function clearCache(): void {
-  wordCaches.clear()
+  segmentMetricCaches.clear()
   emojiCorrectionCache.clear()
 }

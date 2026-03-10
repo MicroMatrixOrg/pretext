@@ -622,6 +622,42 @@ This was a model-strengthening change, not a benchmark tweak. The important veri
 
 So the richer break model appears to be a clean keep: better semantics, same solved accuracy field.
 
+## Segment metrics cache
+
+The old per-font cache stored only:
+- `Map<font, Map<segment, width>>`
+
+That kept `layout()` fast, but `prepare()` still re-did a lot of repeated segment work:
+- grapheme segmentation for the same breakable words
+- per-grapheme width measurement for the same breakable words
+- emoji counting for the same repeated segments
+- repeated CJK classification scans
+
+We replaced it with a richer internal per-font cache:
+- `Map<font, Map<segment, SegmentMetrics>>`
+
+Current cached metrics include:
+- full segment width
+- `containsCJK`
+- lazily computed emoji count
+- lazily computed grapheme widths
+
+The important constraint stayed intact:
+- `layout()` still only consumes the prepared arrays
+- no live canvas work moved back into `layout()`
+
+Safari benchmark spot-check after the change:
+- top-level `prepare()`: `21.5ms -> 13.5ms`
+- `layout()`: `0.04ms -> 0.04ms`
+- Korean prose: `8ms -> 9ms`
+- Hindi prose: `34ms -> 27ms`
+- Arabic prose: `121ms -> 108ms`
+
+So this was a real structural keep:
+- better internal model
+- lower repeated `prepare()` work overall
+- effectively unchanged resize-hot-path cost
+
 ## Thai corpus note
 
 Adding a Thai prose corpus (`นิทานเวตาล/เรื่องที่ 1`) exposed a different class than the Arabic/Hebrew work:

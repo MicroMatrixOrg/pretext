@@ -29,7 +29,7 @@ Internal notes for contributors and agents. Use `README.md` as the public source
 - `prepare()` is internally split into a text-analysis phase and a measurement phase; keep that seam clear, but keep the public API simple unless requirements force a change.
 - The internal segment model now distinguishes at least four break kinds: normal text, collapsible spaces, non-breaking glue (`NBSP` / `NNBSP` / `WJ`-like runs), and zero-width break opportunities. Do not collapse those back into one boolean unless the model gets richer in a better way.
 - `layout()` is the resize hot path: no DOM reads, no canvas calls, no string work, and avoid gratuitous allocations.
-- Word width cache is `Map<font, Map<segment, width>>`; shared across texts and resettable via `clearCache()`.
+- Segment metrics cache is `Map<font, Map<segment, metrics>>`; shared across texts and resettable via `clearCache()`. Width is only one cached fact now; grapheme widths and other segment-derived facts can be populated lazily.
 - Word and grapheme segmenters are hoisted at module scope. Any locale reset should also clear the word cache.
 - Punctuation is merged into preceding word-like segments only, never into spaces.
 - Arabic no-space punctuation clusters such as `فيقول:وعليك` and `همزةٌ،ما` are merged during `prepare()`; keep that logic in preprocessing, not `layout()`.
